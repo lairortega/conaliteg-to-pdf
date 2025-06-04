@@ -1,0 +1,17 @@
+{
+  "name": "conaliteg",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "download": "^8.0.0",
+    "image-to-pdf": "^3.0.2",
+    "sanitize-filename": "^1.6.3"
+  }
+}
