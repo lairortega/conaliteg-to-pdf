@@ -32,7 +32,7 @@ async function downloader(url, bookId, index) {
         const paddedIndex = String(index).padStart(3, '0');
         const urlToDownload = `${url}${paddedIndex}.jpg`;
         try {
-            console.info(`Downloading ${urlToDownload}`);
+            // console.info(`Downloading ${urlToDownload}`);
             await download(urlToDownload, `${bookId}/${paddedIndex}.jpg`);
             index += numCPUs;
         } catch (e) {
