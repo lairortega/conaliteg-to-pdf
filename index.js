@@ -1,6 +1,7 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const readline = require('readline');
 const { pipeline } = require('stream');
 const { execSync } = require('child_process');
 const cluster = require('cluster');
@@ -8,6 +9,20 @@ const numCPUs = require('os').cpus().length;
 const sanitize = require('sanitize-filename');
 const { convert, sizes } = require('image-to-pdf');
 const download = require('download');
+
+/**
+ * Pregunta al usuario por consola y devuelve la respuesta ingresada.
+ */
+function askQuestion(query) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    return new Promise(resolve => rl.question(query, ans => {
+        rl.close();
+        resolve(ans.trim());
+    }));
+}
 
 /**
  * Realiza una petición HEAD para verificar si una URL responde con estado 200.
@@ -205,6 +220,220 @@ async function downloadImagesWorker(url, bookId, index) {
 }
 
 /**
+ * Obtiene los niveles hermanos disponibles en la página principal de CONALITEG
+ * correspondientes al bloque:
+ * body > div.container2.extracted-style-39 > div > div > div:nth-child(1) > div.row > div:nth-child(4)
+ */
+async function fetchCatalogLevels(homeUrl = 'https://libros.conaliteg.gob.mx/') {
+    console.log(`Consultando opciones del catálogo en ${homeUrl}...`);
+    const res = await fetch(homeUrl);
+    if (!res.ok) {
+        throw new Error(`Error al conectar con ${homeUrl} (${res.status}: ${res.statusText})`);
+    }
+    const html = await res.text();
+
+    const containerIdx = html.indexOf('container2 extracted-style-39');
+    if (containerIdx === -1) {
+        throw new Error('No se encontró la sección principal del catálogo en la página de inicio.');
+    }
+
+    const catalogIdx = html.indexOf('Catálogo de libros', containerIdx);
+    const searchFrom = catalogIdx !== -1 ? catalogIdx : containerIdx;
+
+    const rowStart = html.lastIndexOf('<div class="row">', searchFrom);
+    const rowEnd = html.indexOf('<!-- id="row" -->', searchFrom);
+    const rowChunk = (rowStart !== -1 && rowEnd !== -1)
+        ? html.substring(rowStart, rowEnd)
+        : html.substring(searchFrom, searchFrom + 3000);
+
+    const regex = /<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const levels = [];
+    let m;
+    while ((m = regex.exec(rowChunk)) !== null) {
+        const rawHref = m[1];
+        const content = m[2];
+        const titleMatch = content.match(/<p class="titulo-nivel">([^<]+)<\/p>/i) || content.match(/alt="([^"]+)"/i);
+        const title = titleMatch ? titleMatch[1].trim() : rawHref;
+        const fullUrl = rawHref.startsWith('http') ? rawHref : new URL(rawHref, homeUrl).href;
+        levels.push({ title, url: fullUrl });
+    }
+
+    return levels;
+}
+
+/**
+ * Obtiene los libros disponibles en la página de un nivel seleccionado.
+ */
+async function fetchBooksFromLevel(levelUrl) {
+    const res = await fetch(levelUrl);
+    if (!res.ok) {
+        throw new Error(`Error al cargar los libros desde ${levelUrl} (${res.status})`);
+    }
+    const html = await res.text();
+
+    const regex = /<a[^>]*href="([^"]*reader\.html[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const books = [];
+    const seenHrefs = new Set();
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const rawHref = m[1];
+        if (seenHrefs.has(rawHref)) continue;
+        seenHrefs.add(rawHref);
+
+        const inner = m[2];
+        const altMatch = inner.match(/alt="([^"]*)"/i);
+        let title = altMatch ? altMatch[1].trim() : '';
+        if (!title) {
+            title = inner.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        }
+
+        const fullHref = rawHref.startsWith('http') ? rawHref : new URL(rawHref, levelUrl).href;
+
+        let clave = '';
+        try {
+            const parsed = new URL(fullHref);
+            clave = parsed.searchParams.get('clave') || '';
+        } catch (_) {}
+
+        books.push({
+            title: title || clave || 'Libro sin título',
+            clave,
+            url: fullHref
+        });
+    }
+
+    return books;
+}
+
+/**
+ * Detecta el grado escolar de un libro a partir de su título y clave.
+ */
+function detectGrade(book) {
+    const titleLower = (book.title || '').toLowerCase();
+
+    if (titleLower.includes('primer grado') || titleLower.includes('1er grado') || titleLower.includes('primero de secundaria')) return 'Primer Grado';
+    if (titleLower.includes('segundo grado') || titleLower.includes('2do grado') || titleLower.includes('segundo de secundaria')) return 'Segundo Grado';
+    if (titleLower.includes('tercer grado') || titleLower.includes('3er grado') || titleLower.includes('tercero de secundaria')) return 'Tercer Grado';
+    if (titleLower.includes('cuarto grado') || titleLower.includes('4to grado')) return 'Cuarto Grado';
+    if (titleLower.includes('quinto grado') || titleLower.includes('5to grado')) return 'Quinto Grado';
+    if (titleLower.includes('sexto grado') || titleLower.includes('6to grado')) return 'Sexto Grado';
+
+    const match = (book.clave || '').match(/^[A-Z]([0-9])/);
+    if (match) {
+        const num = parseInt(match[1], 10);
+        switch (num) {
+            case 0: return 'Material para Docentes / General';
+            case 1: return 'Primer Grado';
+            case 2: return 'Segundo Grado';
+            case 3: return 'Tercer Grado';
+            case 4: return 'Cuarto Grado';
+            case 5: return 'Quinto Grado';
+            case 6: return 'Sexto Grado';
+        }
+    }
+
+    if (titleLower.includes('docente') || titleLower.includes('maestra y el maestro') || titleLower.includes('familia')) {
+        return 'Material para Docentes / General';
+    }
+
+    return 'General / Multigrado';
+}
+
+/**
+ * Menú interactivo por consola cuando no se proporciona una URL inicial.
+ */
+async function interactiveMenu() {
+    console.log('No se proporcionó URL inicial. Conectando con https://libros.conaliteg.gob.mx/...\n');
+    const levels = await fetchCatalogLevels('https://libros.conaliteg.gob.mx/');
+    if (levels.length === 0) {
+        console.error('No se encontraron niveles educativos disponibles.');
+        process.exit(1);
+    }
+
+    console.log('Catálogo de libros - Niveles disponibles:');
+    levels.forEach((lvl, idx) => {
+        console.log(`  [${idx + 1}] ${lvl.title}`);
+    });
+
+    let selectedLevel = null;
+    while (!selectedLevel) {
+        const answer = await askQuestion(`\nSeleccione una opción (1-${levels.length}) o 'q' para salir: `);
+        if (answer.toLowerCase() === 'q') {
+            console.log('Operación cancelada.');
+            process.exit(0);
+        }
+        const choice = parseInt(answer, 10);
+        if (choice >= 1 && choice <= levels.length) {
+            selectedLevel = levels[choice - 1];
+        } else {
+            console.log('Opción inválida. Intente de nuevo.');
+        }
+    }
+
+    console.log(`\nCargando catálogo de ${selectedLevel.title}...`);
+    const books = await fetchBooksFromLevel(selectedLevel.url);
+    if (books.length === 0) {
+        console.log(`No se encontraron libros disponibles en el catálogo de ${selectedLevel.title}.`);
+        process.exit(0);
+    }
+
+    // Organizar libros por grado
+    const GRADE_ORDER = [
+        'Primer Grado',
+        'Segundo Grado',
+        'Tercer Grado',
+        'Cuarto Grado',
+        'Quinto Grado',
+        'Sexto Grado',
+        'Material para Docentes / General',
+        'General / Multigrado'
+    ];
+
+    const grouped = {};
+    for (const b of books) {
+        const grade = detectGrade(b);
+        if (!grouped[grade]) grouped[grade] = [];
+        grouped[grade].push(b);
+    }
+
+    const flattenedBooks = [];
+    console.log(`\n============================================================`);
+    console.log(`  LIBROS DISPONIBLES EN ${selectedLevel.title.toUpperCase()} (${books.length} encontrados)`);
+    console.log(`============================================================`);
+
+    for (const grade of GRADE_ORDER) {
+        if (!grouped[grade] || grouped[grade].length === 0) continue;
+        console.log(`\n------------------------------------------------------------`);
+        console.log(`  ● ${grade.toUpperCase()} (${grouped[grade].length} ${grouped[grade].length === 1 ? 'libro' : 'libros'})`);
+        console.log(`------------------------------------------------------------`);
+        for (const b of grouped[grade]) {
+            flattenedBooks.push(b);
+            const idx = flattenedBooks.length;
+            const claveLabel = b.clave ? ` [${b.clave}]` : '';
+            console.log(`  [${String(idx).padStart(2, ' ')}] ${b.title}${claveLabel}`);
+        }
+    }
+
+    let selectedBook = null;
+    while (!selectedBook) {
+        const answer = await askQuestion(`\nSeleccione el número del libro a descargar (1-${flattenedBooks.length}) o 'q' para salir: `);
+        if (answer.toLowerCase() === 'q') {
+            console.log('Operación cancelada.');
+            process.exit(0);
+        }
+        const choice = parseInt(answer, 10);
+        if (choice >= 1 && choice <= flattenedBooks.length) {
+            selectedBook = flattenedBooks[choice - 1];
+        } else {
+            console.log('Opción inválida. Intente de nuevo.');
+        }
+    }
+
+    console.log(`\nLibro seleccionado: ${selectedBook.title}`);
+    return selectedBook.url;
+}
+
+/**
  * Analiza la URL ingresada y extrae los datos del libro.
  */
 function parseBookUrl(rawUrl) {
@@ -283,21 +512,14 @@ const main = async () => {
 
     // Obtener la URL de los argumentos
     const args = process.argv.slice(2);
-    if (args.length === 0) {
-        console.log('Uso: node index.js "<url>"');
-        console.log('\nEjemplos:');
-        console.log('  1. Nuevo visor CONALITEG (recomendado):');
-        console.log('     node index.js "https://libros.conaliteg.gob.mx/pdf-reader/reader.html?nivel=secundaria&ciclo=2026&clave=S0LPM"');
-        console.log('  2. Enlace directo al PDF:');
-        console.log('     node index.js "https://libros.conaliteg.gob.mx/pdf-reader/assets/secundaria/2026/S0LPM.pdf"');
-        console.log('  3. Enlace clásico:');
-        console.log('     node index.js "https://libros.conaliteg.gob.mx/2024/S2SAA.htm"');
-        process.exit(1);
+    let inputUrl = args.join(' ').trim();
+
+    // Si no se proporcionó URL, mostrar el menú interactivo
+    if (!inputUrl) {
+        inputUrl = await interactiveMenu();
     }
 
-    const inputUrl = args.join(' ').trim();
-    console.log(`Procesando URL: ${inputUrl}`);
-
+    console.log(`\nProcesando URL: ${inputUrl}`);
     const bookInfo = parseBookUrl(inputUrl);
 
     // Si ya determinamos que es un PDF directo (del nuevo visor o enlace .pdf)
